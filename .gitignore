@@ -79,3 +79,9 @@ local-*
 
 # Ignore personal notes
 *.notes.md
+
+
+.DS_Store
+node_modules
+.tmp
+npm-debug.log
