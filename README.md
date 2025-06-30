@@ -15,6 +15,13 @@ This repository is a collection of hands-on DevOps practice projects, covering t
 1. Browse the subfolders for topic-specific examples.
 2. Each project contains its own README.md with setup and usage instructions.
 3. Clone or fork this repo to experiment and learn DevOps by doing!
+4. update submodule code
+
+```bash
+git submodule init
+git submodule update
+```
+
 
 ## Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop)
