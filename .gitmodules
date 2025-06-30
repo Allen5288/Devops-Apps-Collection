@@ -1,0 +1,3 @@
+[submodule "01-AWS"]
+	path = 01-AWS
+	url = https://github.com/Allen5288/AWS-Apps-Collection.git
