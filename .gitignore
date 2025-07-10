@@ -50,7 +50,6 @@ crash.log
 # Secrets (never commit real secrets!)
 .env
 .env.*
-secrets.*
 
 # OS
 *.bak
