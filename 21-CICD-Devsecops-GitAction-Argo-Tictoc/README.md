@@ -55,12 +55,14 @@ The game implements the following rules:
 ### Installation
 
 1. Clone the repository:
+
    ```bash
    git clone https://github.com/yourusername/devsecops-demo.git
    cd devsecops-demo
    ```
 
 2. Install dependencies:
+
    ```bash
    npm install
    # or
@@ -68,6 +70,7 @@ The game implements the following rules:
    ```
 
 3. Start the development server:
+
    ```bash
    npm run dev
    # or
@@ -87,4 +90,3 @@ yarn build
 ```
 
 The build artifacts will be stored in the `dist/` directory.
-
