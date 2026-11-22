@@ -68,9 +68,88 @@ a single-stage image with build tools is often 800 MB+.
 
 ### What I will add next in this file
 
-- 2026-11-21: the actual multi-stage Dockerfile for the Medical
-  AI FastAPI backend, and the measured size before / after.
-- 2026-11-22: Docker Compose for local dev — API + a local
+- 2026-11-24: Docker Compose for local dev — API + a local
   vector-store stand-in, with healthchecks.
-- Later: the same image deployed to Azure Container Apps vs
-  AWS ECS Fargate — what changes, what stays the same.
+- Later: the same image deployed to Azure Container Apps vs AWS
+  ECS Fargate — what changes, what stays the same.
+
+## 2026-11-23 — Part 2: a multi-stage Dockerfile for the Medical AI FastAPI backend
+
+Part 1 set the pattern; today it lands on a real service — the
+Medical AI Assistant backend (FastAPI + LangChain, Groq LLaMA 3,
+Pinecone). That backend has no build step and no compiled
+dependencies, which makes it a good test of whether multi-stage
+still earns its keep: the win here is not compilation, it is
+leaving the dev tooling and the package cache behind.
+
+### The Dockerfile
+
+```dockerfile
+# ---- Stage 1: build ----
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --target /app/deps -r requirements.txt
+
+# ---- Stage 2: runtime ----
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /app/deps /app/deps
+COPY app/ ./app/
+ENV PYTHONPATH=/app/deps PATH=/app/deps/bin:$PATH
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN useradd --create-home appuser && chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+What is deliberate here:
+
+- **No `COPY . .`** — only `app/` is copied, so tests, eval
+  scripts, and local PDFs never enter the image. The `.dockerignore`
+  below is the second line of defence, not the first.
+- **No dev dependencies in the image** — `requirements.txt` is
+  the runtime list only; `requirements-dev.txt` (pytest, linters)
+  is never copied.
+- **The healthcheck hits a real endpoint** — `/health` must exist
+  in the FastAPI app and return 200 without calling the LLM or the
+  vector store, or a slow model call will mark a healthy container
+  as dead. `start-period=10s` gives uvicorn time to boot.
+- **No secrets** — the Groq key, Pinecone key, and Google key come
+  from the environment at run time, never from the image.
+
+### `.dockerignore` for this service
+
+```text
+.git
+__pycache__
+*.pyc
+.venv
+.env
+*.db
+.uploads/
+eval/
+tests/
+README.md
+```
+
+### Measure it — the commands, and what to record
+
+```bash
+docker build -t medical-ai:slim .
+docker images medical-ai:slim
+docker history medical-ai:slim
+docker run --rm -p 8000:8000 --env-file .env medical-ai:slim
+curl http://localhost:8000/health
+```
+
+Record the numbers in the table below after the first build —
+targets are from Part 1, not measurements:
+
+| Image | Size | Notes |
+|---|---|---|
+| Single-stage (build tools + dev deps) | — measure | baseline to beat |
+| Multi-stage (this Dockerfile) | — measure | target: well under 300 MB |
