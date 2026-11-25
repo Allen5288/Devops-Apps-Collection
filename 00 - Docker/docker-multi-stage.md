@@ -68,9 +68,8 @@ a single-stage image with build tools is often 800 MB+.
 
 ### What I will add next in this file
 
-- 2026-11-24: Docker Compose for local dev — API + a local
-  vector-store stand-in, with healthchecks.
-- Later: the same image deployed to Azure Container Apps vs AWS
+- 2026-11-26: Docker Compose for local dev — done, see Part 3 below.
+- Next: the same image deployed to Azure Container Apps vs AWS
   ECS Fargate — what changes, what stays the same.
 
 ## 2026-11-23 — Part 2: a multi-stage Dockerfile for the Medical AI FastAPI backend
@@ -153,3 +152,108 @@ targets are from Part 1, not measurements:
 |---|---|---|
 | Single-stage (build tools + dev deps) | — measure | baseline to beat |
 | Multi-stage (this Dockerfile) | — measure | target: well under 300 MB |
+
+
+## 2026-11-26 — Part 3: Docker Compose for local dev — the whole stack in one command
+
+Parts 1–2 made one image small and safe. But a developer does not
+run one image — they run the API, the thing the API talks to, and
+the seed data, all at once. Without Compose that is three terminals,
+three commands, and a README section everyone skips. With Compose
+it is `docker compose up`, and the stack matches what the
+Dockerfile promises.
+
+### The stack for the Medical AI backend
+
+The API needs a vector store. In production that is Pinecone; on a
+laptop it is a stub — a tiny HTTP service that accepts the same
+search call and returns canned chunks, so the API code never knows
+the difference. The point of the exercise is the wiring (depends_on,
+healthchecks, env), not the stub.
+```yaml
+# docker-compose.yml — run from the repo root of the Medical AI backend
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile        # the multi-stage build from Part 2
+    ports:
+      - "8000:8000"
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY:?set GROQ_API_KEY in .env}
+      PINECONE_API_KEY: ${PINECONE_API_KEY:?set PINECONE_API_KEY in .env}
+      VECTOR_STORE_URL: http://vector-store:9000
+    env_file:
+      - .env                        # never committed; see .gitignore
+    depends_on:
+      vector-store:
+        condition: service_healthy  # do not start the API until the store answers
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+    volumes:
+      - ./app:/app/app:ro           # live-reload app code without rebuilding
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  vector-store:
+    build:
+      context: ./vector-store-stub
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+```
+
+### What each line is doing, and why
+
+- **`depends_on` with `condition: service_healthy`.** Plain
+  `depends_on` only waits for the container to start, not for the
+  service to answer — the API would boot, fail its first search,
+  and the developer would blame the code. The healthcheck makes
+  the ordering real. (Compose v2 syntax; the old `version:` key is
+  gone — if a tutorial still shows it, the tutorial is out of date.)
+- **`/health` must be cheap.** Same rule as the Dockerfile
+  HEALTHCHECK in Part 2: the endpoint returns 200 without calling
+  the LLM or the vector store, or a slow model call marks a healthy
+  container dead and Compose restarts it in a loop.
+- **Secrets via `${VAR:?message}` and `env_file`.** The `:?`
+  makes Compose fail fast with a readable message instead of
+  starting the API with an empty key and failing on the first
+  question. `.env` is git-ignored; the committed file is
+  `.env.example` with empty values.
+- **The `:ro` volume mount.** App code is mounted read-only and
+  `--reload` picks up changes, so the edit-run loop is seconds, not
+  a rebuild. The mount is read-only so a bug in the container
+  cannot rewrite the developer's source. Production never mounts
+  code — the image from Part 2 is self-contained.
+- **One network, service names as hostnames.** `api` reaches the
+  stub at `http://vector-store:9000` — Compose creates the network
+  and the DNS for it. No `localhost` ports in app config, no
+  `extra_hosts` hacks.
+
+### Commands that matter
+
+```bash
+docker compose up --build     # first run, or after a Dockerfile change
+docker compose up             # day-to-day start
+docker compose ps             # which services are up, and healthy?
+docker compose logs -f api    # follow the API logs only
+docker compose down           # stop and remove containers + network
+docker compose down -v        # also remove named volumes (fresh data)
+```
+
+Add a `profiles:` key for services not every developer needs
+(the eval runner, the seed-data loader) so `up` stays fast and
+`docker compose --profile eval up` starts the extras on demand.
+
+### What I will add next in this file
+
+- Next: the same image deployed to Azure Container Apps vs AWS
+  ECS Fargate — what changes, what stays the same.
