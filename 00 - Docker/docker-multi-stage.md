@@ -68,9 +68,8 @@ a single-stage image with build tools is often 800 MB+.
 
 ### What I will add next in this file
 
-- 2026-11-24: Docker Compose for local dev — API + a local
-  vector-store stand-in, with healthchecks.
-- Later: the same image deployed to Azure Container Apps vs AWS
+- 2026-11-26: Docker Compose for local dev — done, see Part 3 below.
+- Next: the same image deployed to Azure Container Apps vs AWS
   ECS Fargate — what changes, what stays the same.
 
 ## 2026-11-23 — Part 2: a multi-stage Dockerfile for the Medical AI FastAPI backend
