@@ -253,7 +253,123 @@ Add a `profiles:` key for services not every developer needs
 (the eval runner, the seed-data loader) so `up` stays fast and
 `docker compose --profile eval up` starts the extras on demand.
 
+## 2026-11-27 — Part 4: the same image on Azure Container Apps vs AWS ECS Fargate
+
+Parts 1–3 made one image small and safe and gave it a local stack.
+Today the image leaves the laptop: the same multi-stage build from
+Part 2, deployed to two serverless container platforms. The image
+does not change — the platform contract around it does.
+
+### What stays the same on both platforms
+
+- The image: same Dockerfile, same non-root user, same
+  `/app/deps` layout. If the image changes per platform, the
+  "works on my machine" problem just moved to the cloud.
+- The health contract: `/health` returns 200 without calling the
+  LLM or the vector store (Parts 2–3). Both platforms probe it;
+  both will restart a container whose health check fails, so a
+  slow model call in `/health` marks a healthy container dead on
+  either platform.
+- Secrets from the environment, never the image (Part 1): ACA
+  secrets / Key Vault references, ECS secrets from Secrets
+  Manager — same rule, different store.
+- No code mounts in production: the image is self-contained. The
+  `:ro` volume from the Compose file (Part 3) is a dev loop, not a
+  deploy pattern.
+
+### Azure Container Apps — the simple one
+
+```bash
+az containerapp create --name medical-ai --resource-group <rg> \
+  --environment <env> --image medical-ai:slim \
+  --target-port 8000 --ingress external \
+  --min-replicas 0 --max-replicas 5 \
+  --cpu 0.5 --memory 1Gi \
+  --env-vars GROQ_API_KEY=secretref:groq-key \
+             PINECONE_API_KEY=secretref:pinecone-key
+```
+
+- **Scale to zero.** `--min-replicas 0` means an idle demo costs
+  ~$0 — the container stops, and the first request starts it
+  (a cold start of a few seconds, which the client feels once).
+  That is the right shape for a demo RAG backend that gets
+  questions in bursts, not a steady stream.
+- **Scaling is KEDA rules, not a VM count.** Scale on HTTP
+  concurrency or on queue length (a Service Bus queue trigger
+  scales the worker the same way the HTTP trigger scales the API).
+  You declare "scale when this is busy", not "run three of these".
+- **Revisions are the deploy.** Every deploy is a new revision;
+  traffic splits between revisions (90/10 canary) without a load
+  balancer change. A bad revision is a traffic flip back, not a
+  redeploy.
+- **Managed environment, no cluster.** No VPC to design, no node
+  pool to size. The cost is control: no VNet on the Consumption
+  plan, and the networking knobs are fewer than ECS.
+
+### AWS ECS Fargate — the one with more knobs
+
+```json
+{
+  "family": "medical-ai",
+  "cpu": "512",
+  "memory": "1024",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "medical-ai:slim",
+      "portMappings": [{ "containerPort": 8000 }],
+      "healthCheck": {
+        "command": ["CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""],
+        "interval": 30, "timeout": 5, "retries": 3, "startPeriod": 10
+      },
+      "logConfiguration": { "logDriver": "awslogs" },
+      "secrets": [
+        { "name": "GROQ_API_KEY", "valueFrom": "arn:aws:secretsmanager:…:groq-key" }
+      ]
+    }
+  ]
+}
+```
+
+- **No scale to zero.** The smallest always-on task (0.25 vCPU /
+  0.5 GB) runs 24/7 and is a real monthly line item (on the order
+  of $10–15/month). Stopping the service is the only $0 state,
+  and a stopped service answers nothing.
+- **The networking is yours to design** — VPC, subnets, security
+  groups, ALB, target group health checks (a second health check,
+  at the load balancer, on top of the container one). More control,
+  more surface to get wrong: the ALB health check must use the
+  same cheap `/health`, or the ALB will drain a healthy task.
+- **Autoscaling is a policy, not a revision.** Target-tracking on
+  CPU or ALB request count; a deploy is a new task definition and
+  a service update, with `minimumHealthyPercent` deciding whether
+  the old tasks stay up during the rollout.
+
+### Comparison
+
+| | Azure Container Apps | AWS ECS Fargate |
+|---|---|---|
+| Scale to zero | Yes — idle costs ~$0 | No — smallest task is a monthly line |
+| Deploy unit | Revision, traffic-split built in | Task definition + service update |
+| Ingress | Built in (external/internal) | ALB + target group (you build it) |
+| Networking | Managed environment | Your VPC, subnets, security groups |
+| Secrets | ACA secrets / Key Vault | Secrets Manager / SSM |
+| Ops burden | Low — no cluster | Medium — the cluster is serverless, the network is not |
+| When it wins | Bursty demo / side project; already on Azure | Already on AWS with a VPC + ALB; need the control |
+
+### The decision rule
+
+Pick Container Apps for the Medical AI demo: bursty traffic,
+scale-to-zero, and the team is already on Azure for the rest of
+the case. Pick ECS Fargate when the system already lives in an AWS
+VPC with an ALB and the team wants the networking control — or
+when the container needs something ACA does not offer (a sidecar
+pattern beyond Dapr, a specific placement rule). Either way, the
+image, the health endpoint and the secret rule do not change, so
+moving between them later is a platform change, not a rewrite.
+
 ### What I will add next in this file
 
-- Next: the same image deployed to Azure Container Apps vs AWS
-  ECS Fargate — what changes, what stays the same.
+- Next: CI/CD — build the image, scan it, push it, deploy it, with
+  the pipeline failing the build on a critical vulnerability.
