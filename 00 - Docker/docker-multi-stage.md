@@ -369,7 +369,171 @@ pattern beyond Dapr, a specific placement rule). Either way, the
 image, the health endpoint and the secret rule do not change, so
 moving between them later is a platform change, not a rewrite.
 
+
+## 2026-11-28 — Part 5: CI/CD — build the image, scan it, push it, deploy it
+
+Parts 1–4 made one image small and safe, gave it a local stack, and
+showed it running on two platforms — all by hand. A pipeline makes
+the sequence the same every time, and makes a bad image fail the
+build instead of reaching users. This one is for the Medical AI
+backend (FastAPI, the Part 2 Dockerfile). It runs on every push to
+`main` and on every pull request, and deploys only from `main`.
+
+### The stages, in order
+
+1. **Build** the multi-stage image, with BuildKit layer caching so a code-only change does not rebuild the dependency layer.
+2. **Test** inside a container built from that same image, so the tests run against exactly what will ship — not the laptop's Python.
+3. **Scan** for known vulnerabilities, failing the build on any *critical* finding. High findings warn; critical ones block.
+4. **Push** to the registry (Azure Container Registry), tagged twice: the commit SHA and `latest`.
+5. **Deploy** to Azure Container Apps (the Part 4 decision). The ECS Fargate alternative is noted at the end — stages 1–4 do not change.
+
+### The workflow
+
+```yaml
+# .github/workflows/deploy.yml
+name: Build, test, scan and deploy
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+env:
+  REGISTRY: medicalai.azurecr.io
+  IMAGE_NAME: medical-ai
+  RESOURCE_GROUP: medical-ai-rg
+  CONTAINER_APP: medical-ai
+
+jobs:
+  build-test-scan:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to ACR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # BuildKit cache: the pip-install layer is reused across
+          # runs, so a code-only change rebuilds in seconds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run tests inside the image
+        run: |
+          docker run --rm ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            python -m pytest tests/ -q
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # Critical findings fail the build. Highs are shown but
+          # do not block — tighten to HIGH once the base image is
+          # clean enough that highs are rare.
+          exit-code: '1'
+          severity: 'CRITICAL'
+
+  push-and-deploy:
+    needs: build-test-scan
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Build and push (SHA + latest)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Deploy to Azure Container Apps
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          resourceGroup: ${{ env.RESOURCE_GROUP }}
+          containerAppName: ${{ env.CONTAINER_APP }}
+          imageToDeploy: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+```
+
+### Why it is shaped this way
+
+- **Tests run inside the image, not on the runner.** `docker run …
+  pytest` tests the artefact that will deploy, including the
+  non-root user, the `/app/deps` layout and the pinned base image
+  from Parts 1–2. Testing on the runner's Python would test a
+  different environment and miss the packaging bugs the
+  multi-stage build exists to catch.
+- **Two tags, two jobs.** The SHA tag is the deployable unit:
+  immutable, traceable to one commit, and what the deploy step
+  references. `latest` is a convenience for humans pulling the
+  image by hand — nothing deploys `latest`, because `latest` moves
+  and a rollback to "the last good `latest`" is not a thing.
+- **Scan before push, fail on CRITICAL only.** A vulnerable image
+  never lands in the registry at all. The threshold is deliberately
+  narrow at first: a pipeline that fails on every HIGH finding in a
+  Python image full of transitive advisories gets disabled within a
+  week. Start at CRITICAL, fix what it finds, tighten later.
+- **No secrets in the workflow file.** The ACR login comes from
+  `secrets.ACR_USERNAME` / `secrets.ACR_PASSWORD` — the Part 1 rule
+  (no secrets in the image), extended to the pipeline. Prefer a
+  workload identity federation credential over a long-lived ACR
+  password when the subscription allows it.
+
+### Deploying to ECS Fargate instead
+
+Stages 1–4 are identical — same Dockerfile, same tests, same scan,
+same tags — only the registry and the deploy step change: push to
+ECR instead of ACR, then `aws ecs update-service
+--force-new-deployment` with the new task definition. Two
+differences: the deploy is a service update, not a revision, so
+there is no built-in traffic split for a canary (Part 4); and the
+deploy step needs AWS credentials, which should be an OIDC role,
+not a stored access key.
+
+### Rollback
+
+A bad deploy is undone by redeploying the previous good SHA —
+never by pushing a new `latest` over it, and never by editing the
+container app in the portal:
+
+```bash
+# Last good SHA from the workflow run history, then:
+az containerapp update --name medical-ai --resource-group medical-ai-rg \
+  --image medicalai.azurecr.io/medical-ai:<previous-sha>
+```
+
+On Container Apps this creates a new revision, and traffic can be
+split back to the old revision without a redeploy at all
+(`az containerapp revision set-traffic`) — the faster rollback when
+the old revision is still there. On ECS the equivalent is updating
+the service back to the previous task definition revision. Either
+way the rollback is one line because every deploy was a SHA. If a
+deploy fails the health probe (`/health`, Parts 2–3), the platform
+keeps the old revision serving.
+
 ### What I will add next in this file
 
-- Next: CI/CD — build the image, scan it, push it, deploy it, with
-  the pipeline failing the build on a critical vulnerability.
+- Next: the image size and scan results, measured — record the
+  first real build's size, test time, and Trivy findings in the
+  Part 2 table, and tighten the scan threshold to HIGH once the
+  base image is clean.
